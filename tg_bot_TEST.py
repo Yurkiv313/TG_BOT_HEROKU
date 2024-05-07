@@ -1,7 +1,11 @@
+import json
+import uuid
+import datetime
 import telebot
 import threading
 import time
-import datetime
+from datetime import datetime
+import pytz
 import redis
 
 from retry import retry
@@ -12,6 +16,9 @@ import os
 from binance.client import Client
 import requests
 
+from coin_message_publisher import MessagePublisher
+from message_manager import Message
+
 load_dotenv()
 TAAPI_SECRET = os.getenv("TAAPI-SECRET")
 
@@ -21,6 +28,10 @@ key_ttl = 86400
 API_KEY = None
 API_SECRET = None
 user_id = 0
+publisher = MessagePublisher()
+from_coin = 'USDT'
+to_coin = 'UAH'
+minutes_time_interval = "1m"
 
 
 @bot.message_handler(commands=["start"])  # початкова команда
@@ -78,7 +89,9 @@ def get_text_messages(message):
     # Операції з бінанс
     elif message.text == "💰 Баланс":
         if not API_KEY or not API_SECRET:
-            bot.send_message(message.from_user.id, "Спочатку введіть API ключ і secret ключ.")
+            bot.send_message(
+                message.from_user.id, "Спочатку введіть API ключ і secret ключ."
+            )
             return
         client = Client(API_KEY, API_SECRET)
         account_info = client.get_account()
@@ -124,11 +137,18 @@ def get_text_messages(message):
         markup.add(btn)
         bot.send_message(message.from_user.id, "⬇ Виберіть розділ", reply_markup=markup)
         global key_ttl
-        binanceSymbol = "ICPUSDT"
-        if not redis_client.exists(f'{binanceSymbol}-TEST'):
-            refreshState(binanceSymbol)
+        binanceSymbol = from_coin + to_coin
+        if not redis_client.exists(f"{binanceSymbol}-AY_TEST"):
+            initial_state = {
+                "last_action": "",
+                "last_buy_price": "",
+                "last_sell_price": "",
+            }
+            redis_client.hmset(f"{binanceSymbol}-AY_TEST", initial_state)
         # schedule.every(2).seconds.do(lambda: trade("SOL", "USDT", 0.06, 0.52))
-        schedule.every(2).seconds.do(lambda: trade("ICP", "USDT", 6, 0.05)).tag('Trading job')
+        schedule.every(3).seconds.do(lambda: trade(from_coin, to_coin, 6, 0.05)).tag(
+            "Trading job"
+        )
         run_continuously()
 
     elif message.text == "Stop all tradings":
@@ -137,8 +157,8 @@ def get_text_messages(message):
         markup.add(btn)
         bot.send_message(message.from_user.id, "⬇ Виберіть розділ", reply_markup=markup)
         schedule.clear()
-        binanceSymbol = "ICPUSDT"
-        refreshState(f'{binanceSymbol}-TEST')
+        binanceSymbol = from_coin + to_coin
+        refreshState(f"{binanceSymbol}-AY_TEST")
 
     elif message.text == "Get futures notification":
         markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
@@ -151,10 +171,14 @@ def get_text_messages(message):
                 rsi = int(rsi14[0]["value"])
                 if rsi is not None:
                     if rsi < 15:
-                        bot.send_message(message.from_user.id, "RSI is below 15! SOL/USDT Time 1m")
+                        bot.send_message(
+                            message.from_user.id, "RSI is below 15! SOL/USDT Time 1m"
+                        )
                         time.sleep(120)
                     elif rsi > 65:
-                        bot.send_message(message.from_user.id, "RSI is above 65! SOL/USDT Time 1m")
+                        bot.send_message(
+                            message.from_user.id, "RSI is above 65! SOL/USDT Time 1m"
+                        )
                         time.sleep(120)
             except Exception as ex:
                 print("Caught exception.")
@@ -169,15 +193,21 @@ def get_text_messages(message):
         markup.add(btn)
 
         all_jobs = schedule.get_jobs()
-        new_list = [','.join(map(str, x.tags)) for x in all_jobs]
-        bot.send_message(message.from_user.id,
-                         str('\n'.join(new_list)) if len(new_list) != 0 else 'There are no active jobs.')
+        new_list = [",".join(map(str, x.tags)) for x in all_jobs]
+        bot.send_message(
+            message.from_user.id,
+            str("\n".join(new_list))
+            if len(new_list) != 0
+            else "There are no active jobs.",
+        )
 
 
 def refreshState(key):
     if redis_client.exists(key):
         redis_client.delete(key)
-    redis_client.hset(key, mapping={"last_action": "sell", "last_buy_price": 0, "last_sell_price": 0})
+    redis_client.hset(
+        key, mapping={"last_action": "sell", "last_buy_price": 0, "last_sell_price": 0}
+    )
     redis_client.expire(name=key, time=key_ttl)
 
 
@@ -228,34 +258,93 @@ def run_continuously(interval=1):
 
 def trade(fromCoin, toCoin, quantity, sell_amount):
     try:
+        id = uuid.uuid4()
+        print("Start job", id)
         global API_KEY, API_SECRET
         client = Client(API_KEY, API_SECRET)
         # klines = client.get_klines(symbol=binanceSymbol, interval="5m", limit=2)
         binance_symbol = f"{fromCoin}{toCoin}"
-        current_price = callWithRetry(client.get_symbol_ticker, symbol=binance_symbol)["price"]
-        encoded_state = redis_client.hgetall(f'{binance_symbol}-TEST')
-        state = {key.decode('utf-8'): value.decode('utf-8') for key, value in encoded_state.items()}
-
-        # macd_diff = last_macd - last_macd_signal
-        # last_macd_signal = macdIndicator[1]["valueMACDSignal"]
+        current_price = float(
+            callWithRetry(client.get_symbol_ticker, symbol=binance_symbol)["price"]
+        )
+        print("current_price = ", current_price, id)
+        encoded_state = redis_client.hgetall(f"{binance_symbol}-AY_TEST")
+        state = {
+            key.decode("utf-8"): value.decode("utf-8")
+            for key, value in encoded_state.items()
+        }
 
         if state["last_action"] == "sell":
-            rsi6 = getIndicatorValue('rsi', f"{fromCoin}/{toCoin}", "1m", 2, 3)
-            last_rsi = rsi6[1]["value"]
-            if last_rsi < 20:
-                adx_indicator = getIndicatorValue('adx', f"{fromCoin}/{toCoin}", "1m", 2, 14)
-                last_adx = adx_indicator[1]["value"]
-                macd_indicator = getIndicatorValue('macd', f"{fromCoin}/{toCoin}", "1m", 2, 3)
-                last_macd = macd_indicator[1]["valueMACD"]
-                if last_adx < 20 or (last_adx > 20 and last_macd > 0.002):
-                    state["last_action"] = "buy"
-                    state["last_buy_price"] = current_price
-                    # response = callWithRetry(client.order_market_buy, symbol=binanceSymbol, quantity=quantity)
-                    buy_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    buy_message = (f"Buy {fromCoin} at {current_price} at {buy_time}.\n"
-                                   f"\nRsi: {last_rsi}; Adx:{last_adx}; Macd:{last_macd};")
-                    callWithRetry(bot.send_message, user_id, buy_message)
-                    print(buy_message)
+            stoch_rsi = getIndicatorValue("stochrsi", f"{fromCoin}/{toCoin}", minutes_time_interval, 5)
+            print("Buy operation started", id)
+            print("StochRsi FastD line = ", stoch_rsi, id)
+            last_rsi_d = stoch_rsi[1]["valueFastD"]  # yellow line
+            last_rsi_k = stoch_rsi[1]["valueFastK"]
+            current_rsi_k = stoch_rsi[0]["valueFastK"]  # blue line
+
+            before_last_rsi_d = stoch_rsi[2]["valueFastD"]  # yellow line
+            before_last_rsi_k = stoch_rsi[2]["valueFastK"]
+
+            if ((last_rsi_d < 14 and last_rsi_k < 14) and current_rsi_k > 21) or (before_last_rsi_d < 20 and before_last_rsi_k < 20 and last_rsi_k > 20):
+            # if last_rsi_d < 100:
+                # adx_indicator = getIndicatorValue('adx', f"{fromCoin}/{toCoin}", minutes_time_interval, 2, 14)
+                # last_adx = adx_indicator[1]["value"]
+                macd_indicator = getIndicatorValue(
+                    "macd", f"{fromCoin}/{toCoin}", minutes_time_interval, 16
+                )
+                negative_hists = [x for x in macd_indicator if x["valueMACDHist"] < 0]
+                last_macd_hist = macd_indicator[1]["valueMACDHist"]
+
+                # if len(negative_hists) != len(macd_indicator) and last_macd_hist < 0.001:
+                print("macd_indicator = ", macd_indicator, id)
+                # second_before_last_macd_hist = macd_indicator[3]["valueMACDHist"]
+                # before_last_macd_hist = macd_indicator[2]["valueMACDHist"]
+                # last_macd_hist = macd_indicator[1]["valueMACDHist"]
+                # current_forming_macd_hist = macd_indicator[0]["valueMACDHist"]
+                # is_macd_hist_negative = second_before_last_macd_hist < 0 and before_last_macd_hist < 0 and last_macd_hist < 0
+                # is_last_macd_lower_than_two_before = current_forming_macd_hist > last_macd_hist > before_last_macd_hist
+
+                # negativeMacdDecreased = is_macd_hist_negative and is_last_macd_lower_than_two_before
+                # last_macd = macd_indicator[1]["valueMACD"]
+                last_macd_signal = macd_indicator[1]["valueMACDSignal"]
+                # last_macd_diff = last_macd - last_macd_signal
+                # last_madc_hist = macd_indicator[1]["valueMACDHist"]
+                # if negativeMacdDecreased:
+                last_madc_value = macd_indicator[1]["valueMACD"]
+                state["last_action"] = "buy"
+                state["last_buy_price"] = current_price
+                # response = callWithRetry(client.order_market_buy, symbol=binanceSymbol, quantity=quantity)
+                # buy_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                ukraine_tz = pytz.timezone("Europe/Kiev")
+                ukraine_time = datetime.now(ukraine_tz)
+                ukraine_time_str = ukraine_time.strftime("%Y-%m-%d %H:%M:%S %Z")
+                message = Message(
+                    user_id=user_id,
+                    coin=binance_symbol,
+                    current_coin_price=current_price,
+                    quantity=quantity,
+                    last_action=state["last_action"],
+                    created_date=ukraine_time_str,
+                    last_stoch_rsi_k=last_rsi_k,
+                    last_macd_value=last_madc_value,
+                    last_macd_signal=last_macd_signal,
+                    last_macd_hist=last_macd_hist,
+                )
+                message_json = json.dumps(vars(message))
+                callWithRetry(bot.send_message, user_id, message_json)
+                publisher.send_message(message_json)
+                print(message_json)
+                # обєкт для відправки в ребіт
+        elif state["last_action"] == "buy":
+            print("Sell operation started", id)
+            macd_indicator = getIndicatorValue(
+                "macd", f"{fromCoin}/{toCoin}", minutes_time_interval, 3, 3
+            )
+            print(f"id = {id}; macd_indicator = {macd_indicator}")
+
+            before_last_macd_hist = macd_indicator[2]["valueMACDHist"]
+            last_macd_hist = macd_indicator[1]["valueMACDHist"]
+            positiveMacdIncreased = 0 < last_macd_hist < before_last_macd_hist
 
         if state["last_action"] == "buy" and float(current_price) > float(state["last_buy_price"]) + sell_amount:
             # response = callWithRetry(client.order_market_sell, symbol=binanceSymbol, quantity=quantity)
@@ -299,8 +388,8 @@ def futures():
 
 
 @retry(tries=5, delay=5)
-def getIndicatorValue(indicator, symbol, interval, backtracks, period):
-    api_url = f"https://api.taapi.io/{indicator}?secret={TAAPI_SECRET}&exchange=binance&symbol={symbol}&interval={interval}&backtracks={backtracks}&period={period}"
+def getIndicatorValue(indicator, symbol, interval, backtracks, period=3, k_period=3):
+    api_url = f"https://api.taapi.io/{indicator}?secret={TAAPI_SECRET}&exchange=binance&symbol={symbol}&interval={interval}&backtracks={backtracks}&period={period}&kPeriod={k_period}"
     response = requests.get(api_url)
     return response.json()
 
